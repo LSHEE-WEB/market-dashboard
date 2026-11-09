@@ -127,36 +127,60 @@ def parse_smbs(text: str) -> dict:
     return out
 
 
-def fetch_smbs(date: str) -> dict:
+def fetch_smbs(date: str, debug: bool = True) -> dict:
     r = requests.get(SMBS_URL.format(date=date), headers=UA, timeout=20)
     r.raise_for_status()
     text = r.content.decode(r.encoding or "utf-8", errors="ignore")
     vals = parse_smbs(text)
-    if not vals:
+    if not vals and debug:
         save_debug(f"smbs_{date}.txt", text)
     return vals
 
 
+FX_BACKFILL_DAYS = 730   # 환율 과거 데이터 범위 (약 2년)
+
+
 def update_fx(data: dict):
+    """최근 6일은 매번 다시 확인, 그 이전 2년 중 비어 있는 영업일은 한 번만 채움(휴일은 기록해 두고 건너뜀)"""
+    from concurrent.futures import ThreadPoolExecutor
     series = data["series"]
-    have = min(len(series.get(k, {}).get("history", [])) for k in SMBS_KEYS)
-    days_back = 120 if have < 20 else 6  # 처음엔 과거 데이터 백필
     today = now_kst().date()
-    ok_any = False
-    errors = []
-    for i in range(days_back, -1, -1):
+    have = set.intersection(*[{p["date"] for p in series[k]["history"]} for k in SMBS_KEYS])
+    empty = set(data.get("smbs_empty_dates", []))
+    targets = []
+    for i in range(FX_BACKFILL_DAYS, -1, -1):
         d = today - timedelta(days=i)
         if d.weekday() >= 5:
             continue
         ds = d.isoformat()
+        if i <= 6 or (ds not in have and ds not in empty):
+            targets.append((ds, i <= 6))
+    log(f"환율 조회 {len(targets)}일")
+    ok_any = False
+    errors = []
+
+    def job(t):
+        ds, recent = t
         try:
-            vals = fetch_smbs(ds)
+            return ds, recent, fetch_smbs(ds, debug=recent), None
         except Exception as e:
-            errors.append(f"{ds}: {e}")
-            continue
-        for k, v in vals.items():
-            upsert(series[k]["history"], ds, v)
-            ok_any = True
+            return ds, recent, None, e
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for ds, recent, vals, err in ex.map(job, targets):
+            if err:
+                errors.append(f"{ds}: {err}")
+                continue
+            if not vals:
+                if not recent:
+                    empty.add(ds)   # 휴일 등 고시 없는 날
+                continue
+            for k, v in vals.items():
+                upsert(series[k]["history"], ds, v)
+                ok_any = True
+    data["smbs_empty_dates"] = sorted(empty)[-400:]
+    if not ok_any and have:
+        ok_any = not errors  # 새 값이 없어도 오류가 없으면 정상
     if ok_any:
         for k in SMBS_KEYS:
             series[k]["status"] = "ok"
