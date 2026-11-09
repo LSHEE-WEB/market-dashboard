@@ -304,8 +304,30 @@ def pick_value(cells: list[str], header: list[str], name: str) -> float | None:
 
 
 def update_petchem(data: dict):
+    """1순위: KoreaPDS 차트 데이터(2년 이력) / 2순위: 원자재가격 표에서 최신값"""
     series = data["series"]
-    html, err = None, None
+    pending = []
+    for key in ("naphtha", "ethylene", "pulp"):
+        s = series[key]
+        days = 730 if len(s["history"]) < 30 else 45
+        try:
+            rows = fetch_kpds_history(key, days)
+            for d, v in rows:
+                upsert(s["history"], d, v)
+            s["status"] = "ok"
+            s["source_used"] = "KoreaPDS 차트"
+            s.pop("error", None)
+            log(key, f"차트 이력 {len(rows)}건")
+        except Exception as e:
+            log(key, "차트 이력 실패 → 표에서 최신값 시도:", e)
+            pending.append(key)
+    if pending:
+        update_petchem_table(data, pending)
+
+
+def update_petchem_table(data: dict, keys: list):
+    series = data["series"]
+    html, err, found = None, None, {}
     for url in (KPDS_URL, MOTIR_PAGE):
         try:
             r = requests.get(url, headers={**UA, "Referer": MOTIR_PAGE}, timeout=30)
@@ -322,7 +344,7 @@ def update_petchem(data: dict):
             err = f"{url}: {e}"
             found = {}
     today = now_kst().date().isoformat()
-    for key in ("naphtha", "ethylene", "pulp"):
+    for key in keys:
         s = series[key]
         if key in found:
             f = found[key]
@@ -333,6 +355,153 @@ def update_petchem(data: dict):
         else:
             s["status"] = "error"
             s["error"] = err or "품목을 찾지 못함"
+
+
+# ---------------------------------------------------------------- KoreaPDS 차트 이력 (FusionCharts XML)
+KPDS_CHART_URL = "https://www.koreapds.com/wacs/wms/price_chart_backendprc.php"
+# 개발자도구 Payload에서 확인한 품목 코드
+KPDS_ITEMS = {
+    "naphtha":  dict(large_cd="22", middle_cd="01", small_cd="00", distr_cd="00", item_cd="01", itemd_cd="00", deal_cd="2432", gap_cd="00"),
+    "ethylene": dict(large_cd="22", middle_cd="02", small_cd="00", distr_cd="00", item_cd="01", itemd_cd="03", deal_cd="2441", gap_cd="00"),
+    "pulp":     dict(large_cd="29", middle_cd="01", small_cd="00", distr_cd="00", item_cd="01", itemd_cd="16", deal_cd="3010", gap_cd="00"),
+}
+MONTHS_EN = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+def _attr(tag: str, name: str) -> str | None:
+    m = re.search(r"\b" + name + r"\s*=\s*['\"]([^'\"]*)['\"]", tag, flags=re.I)
+    return m.group(1) if m else None
+
+
+def _month_day(s: str) -> tuple[int, int] | None:
+    """연도 없는 라벨: '08/03', '8.3', '08-03', '8월 3일', 'Aug 3', '3 Aug'"""
+    s = s.strip()
+    m = re.search(r"(?<!\d)(\d{1,2})\s*[./\-월]\s*(\d{1,2})(?!\d)", s)
+    if m:
+        mo, d = int(m.group(1)), int(m.group(2))
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            return mo, d
+    m = re.search(r"([A-Za-z]{3})[a-z]*\.?\s*(\d{1,2})|(\d{1,2})\s*([A-Za-z]{3})", s)
+    if m:
+        mon = (m.group(1) or m.group(4) or "").lower()
+        day = int(m.group(2) or m.group(3))
+        if mon in MONTHS_EN:
+            return MONTHS_EN[mon], day
+    return None
+
+
+def parse_fusion_xml(xml: str, today=None) -> list[tuple[str, float]]:
+    """FusionCharts XML에서 (날짜, 값) 목록 추출.
+    날짜는 set의 label/toolText 또는 categories의 label에서 읽고, 연도가 없으면 최신=올해로 거꾸로 추정."""
+    today = today or now_kst().date()
+    sets = re.findall(r"<set\b[^>]*>", xml, flags=re.I)
+    cats = [c for c in re.findall(r"<category\b[^>]*>", xml, flags=re.I)]
+    labels, values = [], []
+    for i, s in enumerate(sets):
+        v = to_float(_attr(s, "value"))
+        lab = _attr(s, "label") or _attr(s, "toolText") or _attr(s, "tooltext") or ""
+        if not lab and i < len(cats):
+            lab = _attr(cats[i], "label") or _attr(cats[i], "toolText") or ""
+        labels.append(lab)
+        values.append(v)
+    # toolText에 날짜가 있으면 그걸 우선 (label은 축 표시용으로 축약된 경우가 많음)
+    full = []
+    for s, lab in zip(sets, labels):
+        tt = _attr(s, "toolText") or _attr(s, "tooltext") or ""
+        full.append(norm_date(tt) if DATE_RE.search(tt) else norm_date(lab) if DATE_RE.search(lab) else None)
+    out: list[tuple[str, float]] = []
+    if any(full):
+        for d, v in zip(full, values):
+            if d and v is not None:
+                out.append((d, v))
+        return out
+    # 연도 없는 라벨 → 마지막(최신)부터 거꾸로 연도 추정
+    md = [_month_day(l) for l in labels]
+    if not any(md):
+        return []
+    year = today.year
+    nxt = None
+    rev = []
+    for x, v in zip(reversed(md), reversed(values)):
+        if x is None or v is None:
+            continue
+        mo, d = x
+        if nxt is None:
+            if (mo, d) > (today.month, today.day):
+                year -= 1
+        elif (mo, d) > nxt:
+            year -= 1
+        nxt = (mo, d)
+        try:
+            rev.append((datetime(year, mo, d).date().isoformat(), v))
+        except ValueError:
+            continue
+    return list(reversed(rev))
+
+
+def fetch_kpds_history(key: str, days: int) -> list[tuple[str, float]]:
+    import random
+    form = {**KPDS_ITEMS[key], "per": str(days), "rand": str(random.random())}
+    headers = {**UA, "Referer": KPDS_URL, "X-Requested-With": "XMLHttpRequest",
+               "Origin": "https://www.koreapds.com"}
+    r = requests.post(KPDS_CHART_URL, data=form, headers=headers, timeout=30)
+    r.raise_for_status()
+    if not r.encoding or r.encoding.lower() == "iso-8859-1":
+        r.encoding = r.apparent_encoding
+    rows = parse_fusion_xml(r.text)
+    if not rows:
+        save_debug(f"kpds_chart_{key}.xml", r.text)
+        raise RuntimeError("차트 응답에서 날짜/값을 읽지 못함 (data/debug 확인)")
+    return rows
+
+
+# ---------------------------------------------------------------- 과거 데이터 CSV 병합
+BACKFILL_FILE = ROOT / "data" / "backfill.csv"
+NAME_ALIASES = {
+    "naphtha": ["naphtha", "나프타", "납사"], "ethylene": ["ethylene", "에틸렌"],
+    "pulp": ["pulp", "펄프", "sbhk"], "usdkrw": ["usdkrw", "달러", "usd"], "cnykrw": ["cnykrw", "위안", "cny"],
+    "jpykrw": ["jpykrw", "엔", "jpy"], "wti": ["wti"], "brent": ["brent", "브렌트"],
+}
+
+
+def col_key(h: str) -> str | None:
+    h = h.strip().lower()
+    for key, names in NAME_ALIASES.items():
+        if any(n == h or (len(n) > 1 and n in h) for n in names):
+            return key
+    return None
+
+
+def merge_backfill(data: dict):
+    """data/backfill.csv (첫 열=날짜, 다음 열=품목) 내용을 이력에 합침. 여러 번 실행돼도 안전."""
+    if not BACKFILL_FILE.exists():
+        return
+    import csv
+    raw = BACKFILL_FILE.read_bytes()
+    for enc in ("utf-8-sig", "cp949"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    rows = list(csv.reader(text.splitlines()))
+    if not rows:
+        return
+    keys = [col_key(h) for h in rows[0][1:]]
+    n = 0
+    for r in rows[1:]:
+        if not r:
+            continue
+        d = norm_date(r[0])
+        if not d:
+            continue
+        for k, cell in zip(keys, r[1:]):
+            v = to_float(cell)
+            if k and v:
+                upsert(data["series"][k]["history"], d, v)
+                n += 1
+    log(f"backfill.csv 병합: {n}개 값")
 
 
 # ---------------------------------------------------------------- 알림
@@ -418,6 +587,11 @@ def main():
             for k in keys:
                 data["series"][k]["status"] = "error"
                 data["series"][k]["error"] = str(e)
+
+    try:
+        merge_backfill(data)
+    except Exception as e:
+        log("backfill.csv 병합 실패:", e)
 
     alerts = compute_changes(data)
     notify(data, alerts)
