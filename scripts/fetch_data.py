@@ -306,18 +306,33 @@ def pick_value(cells: list[str], header: list[str], name: str) -> float | None:
 def update_petchem(data: dict):
     """1순위: KoreaPDS 차트 데이터(2년 이력) / 2순위: 원자재가격 표에서 최신값"""
     series = data["series"]
+    table = latest_table_dates()
     pending = []
     for key in ("naphtha", "ethylene", "pulp"):
         s = series[key]
-        days = 730 if len(s["history"]) < 30 else 45
+        end_date = end_value = None
+        if key in table:
+            end_date = datetime.fromisoformat(table[key]["date"]).date()
+            end_value = table[key]["value"]
         try:
-            rows = fetch_kpds_history(key, days)
-            for d, v in rows:
-                upsert(s["history"], d, v)
+            rows, approx = fetch_kpds_history(key, 730, end_date, end_value)
+            if approx:
+                # 날짜를 추정한 경우: 매번 새로 계산하므로 2년 구간은 통째로 교체 (중복 방지)
+                first = rows[0][0]
+                s["history"] = [p for p in s["history"] if p["date"] < first] + \
+                               [{"date": d, "value": v} for d, v in rows]
+                s["note"] = "일간 차트 날짜는 월 표시 기준 추정값입니다 (수일 오차 가능)"
+            else:
+                for d, v in rows:
+                    upsert(s["history"], d, v)
+                s.pop("note", None)
+            # 표의 최신값이 더 정확하면 마지막 점을 덮어씀
+            if key in table:
+                upsert(s["history"], table[key]["date"], table[key]["value"])
             s["status"] = "ok"
             s["source_used"] = "KoreaPDS 차트"
             s.pop("error", None)
-            log(key, f"차트 이력 {len(rows)}건")
+            log(key, f"차트 이력 {len(rows)}건" + (" (날짜 추정)" if approx else ""))
         except Exception as e:
             log(key, "차트 이력 실패 → 표에서 최신값 시도:", e)
             pending.append(key)
@@ -391,7 +406,87 @@ def _month_day(s: str) -> tuple[int, int] | None:
     return None
 
 
-def parse_fusion_xml(xml: str, today=None) -> list[tuple[str, float]]:
+def _month_marker(label: str) -> tuple[int, int | None] | None:
+    """'Nov{br}`24' → (11, 2024), 'Mar' → (3, None)"""
+    s = re.sub(r"\{br\}|<br\s*/?>|&#10;", " ", label or "").strip()
+    m = re.fullmatch(r"([A-Za-z]{3})[a-z]*\.?\s*(?:[`'’]?\s*(\d{2}|\d{4}))?", s)
+    if not m or m.group(1).lower() not in MONTHS_EN:
+        return None
+    y = m.group(2)
+    return MONTHS_EN[m.group(1).lower()], (None if not y else int(y) + (2000 if len(y) == 2 else 0))
+
+
+def _weekdays(y: int, mo: int) -> list:
+    from calendar import monthrange
+    return [datetime(y, mo, d).date() for d in range(1, monthrange(y, mo)[1] + 1)
+            if datetime(y, mo, d).weekday() < 5]
+
+
+def _prev_weekday(d):
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def _dates_from_month_markers(labels, values, today, end_date=None) -> list[tuple[str, float]]:
+    """일간 차트인데 점마다 날짜가 없고 일정 간격으로 월 표시('Nov{br}`24', 'Mar' …)만 있는 경우.
+    마지막 점 = 최신 발표일(end_date)로 고정하고, 각 월 표시 점이 해당 월 안에 들어가도록
+    '점 1개당 평균 달력일수'를 맞춘 뒤 평일로 맞춰 날짜를 추정한다 (오차: 보통 수일 이내)."""
+    pts = [(i, v) for i, v in enumerate(values) if v is not None]
+    if not pts:
+        return []
+    n = len(values)
+    end = _prev_weekday(end_date or (today - timedelta(days=1)))
+    idx = [(i, _month_marker(l)) for i, l in enumerate(labels) if _month_marker(l)]
+    # 연도 채우기 (마지막 표시부터 거꾸로, 연도 표기가 있으면 그것 우선)
+    ys = [0] * len(idx)
+    for k in range(len(idx) - 1, -1, -1):
+        mo, y = idx[k][1]
+        if y:
+            ys[k] = y
+        elif k == len(idx) - 1:
+            ys[k] = end.year if mo <= end.month else end.year - 1
+        else:
+            ys[k] = ys[k + 1] - (1 if mo >= idx[k + 1][1][0] else 0)
+    # 구간별 기준점: 마지막 점 = end. 거꾸로 가며 각 월 표시 점을
+    # '평일 기준 간격(1.4일/점)'으로 추정하되, 그 달 범위를 벗어나면 달 안으로 맞춘다.
+    anchors = {n - 1: 0.0}          # end 기준 '며칠 전'(실수)
+    cur_i, cur_back = n - 1, 0.0
+    for (i, (mo, _)), y in sorted(zip(idx, ys), key=lambda t: -t[0][0]):
+        if i >= cur_i:
+            continue
+        first = datetime(y, mo, 1).date()
+        while first.weekday() >= 5:      # 그 달 첫 평일
+            first += timedelta(days=1)
+        last = _prev_weekday(datetime(y + (mo == 12), mo % 12 + 1, 1).date() - timedelta(days=1))
+        back = cur_back + (cur_i - i) * 1.4
+        back = min(max(back, (end - last).days), (end - first).days)
+        back = max(back, cur_back + (cur_i - i))   # 점마다 최소 하루
+        anchors[i] = back
+        cur_i, cur_back = i, back
+    keys = sorted(anchors)
+    def est(i):
+        if i <= keys[0]:
+            back = anchors[keys[0]] + (keys[0] - i) * 1.4
+        else:
+            back = 0.0
+            for a_i, b_i in zip(keys, keys[1:]):
+                if a_i <= i <= b_i:
+                    back = anchors[a_i] + (anchors[b_i] - anchors[a_i]) * (i - a_i) / (b_i - a_i)
+                    break
+        return end - timedelta(days=round(back))
+    out = []
+    nxt = None
+    for i, v in reversed(pts):
+        d = _prev_weekday(est(i))
+        if nxt is not None and d >= nxt:
+            d = _prev_weekday(nxt - timedelta(days=1))
+        nxt = d
+        out.append((d.isoformat(), v))
+    return list(reversed(out))
+
+
+def parse_fusion_xml(xml: str, today=None, end_date=None) -> list[tuple[str, float]]:
     """FusionCharts XML에서 (날짜, 값) 목록 추출.
     날짜는 set의 label/toolText 또는 categories의 label에서 읽고, 연도가 없으면 최신=올해로 거꾸로 추정."""
     today = today or now_kst().date()
@@ -416,6 +511,9 @@ def parse_fusion_xml(xml: str, today=None) -> list[tuple[str, float]]:
             if d and v is not None:
                 out.append((d, v))
         return out
+    # 월 표시만 있는 일간 차트 (예: 'Nov{br}`24', 'Mar', …, 나머지 라벨은 빈칸)
+    if any(_month_marker(l) for l in labels) and not any(_month_day(l) for l in labels):
+        return _dates_from_month_markers(labels, values, today, end_date)
     # 연도 없는 라벨 → 마지막(최신)부터 거꾸로 연도 추정
     md = [_month_day(l) for l in labels]
     if not any(md):
@@ -440,7 +538,8 @@ def parse_fusion_xml(xml: str, today=None) -> list[tuple[str, float]]:
     return list(reversed(rev))
 
 
-def fetch_kpds_history(key: str, days: int) -> list[tuple[str, float]]:
+def fetch_kpds_history(key: str, days: int, end_date=None, end_value=None) -> tuple[list[tuple[str, float]], bool]:
+    """(날짜, 값) 목록과 '날짜 추정 여부'를 돌려줌"""
     import random
     form = {**KPDS_ITEMS[key], "per": str(days), "rand": str(random.random())}
     headers = {**UA, "Referer": KPDS_URL, "X-Requested-With": "XMLHttpRequest",
@@ -449,11 +548,29 @@ def fetch_kpds_history(key: str, days: int) -> list[tuple[str, float]]:
     r.raise_for_status()
     if not r.encoding or r.encoding.lower() == "iso-8859-1":
         r.encoding = r.apparent_encoding
-    rows = parse_fusion_xml(r.text)
+    rows = parse_fusion_xml(r.text, end_date=end_date)
+    # 표의 최신값과 차트 마지막 값이 다르면 차트가 하루 늦은 것 → 기준일을 직전 평일로
+    if rows and end_date and end_value is not None and abs(rows[-1][1] - end_value) > 1e-6:
+        rows = parse_fusion_xml(r.text, end_date=_prev_weekday(end_date - timedelta(days=1)))
     if not rows:
         save_debug(f"kpds_chart_{key}.xml", r.text)
         raise RuntimeError("차트 응답에서 날짜/값을 읽지 못함 (data/debug 확인)")
-    return rows
+    labels = re.findall(r"<category\b[^>]*label\s*=\s*['\"]([^'\"]*)", r.text)
+    approx = any(_month_marker(l) for l in labels) and not any(_month_day(l) for l in labels)
+    return rows, approx
+
+
+def latest_table_dates() -> dict:
+    """원자재가격 표에서 품목별 최신 발표일 (날짜 추정의 기준점)"""
+    try:
+        r = requests.get(KPDS_URL, headers={**UA, "Referer": MOTIR_PAGE}, timeout=30)
+        r.raise_for_status()
+        if not r.encoding or r.encoding.lower() == "iso-8859-1":
+            r.encoding = r.apparent_encoding
+        return {k: v for k, v in parse_kpds(r.text).items() if v.get("date")}
+    except Exception as e:
+        log("표 최신일 조회 실패:", e)
+        return {}
 
 
 # ---------------------------------------------------------------- 과거 데이터 CSV 병합
