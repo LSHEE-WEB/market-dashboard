@@ -156,9 +156,9 @@
 
   <section id="sec-petchem">
     <div class="sec-head">
-      <h2>석유화학 · 펄프</h2>
+      <h2>석유화학 · 펄프 · 팜오일</h2>
       <div class="ranges" data-group="petchem"></div>
-      <div class="src">출처: <a href="https://www.motir.go.kr/kor/contents/103" target="_blank" rel="noopener">산업통상부 원자재가격정보</a></div>
+      <div class="src">출처: <a href="https://www.motir.go.kr/kor/contents/103" target="_blank" rel="noopener">산업통상부 원자재가격정보</a> · <a href="https://ko.tradingeconomics.com/commodity/palm-oil" target="_blank" rel="noopener">Trading Economics</a></div>
     </div>
     <div class="grid" id="grid-petchem"></div>
   </section>
@@ -172,7 +172,7 @@
 <div id="toast"></div>
 
 <script>
-const ORDER = { fx: ["usdkrw", "cnykrw", "jpykrw"], oil: ["wti", "brent"], petchem: ["naphtha", "ethylene", "pulp"] };
+const ORDER = { fx: ["usdkrw", "cnykrw", "jpykrw"], oil: ["wti", "brent"], petchem: ["naphtha", "ethylene", "pulp", "palmoil"] };
 const RANGES = [["1M", 31], ["3M", 92], ["6M", 183], ["1Y", 366], ["전체", 99999]];
 const DEFAULT_RANGE = { fx: 92, oil: 183, petchem: 99999 };
 const rangeState = { ...DEFAULT_RANGE };
