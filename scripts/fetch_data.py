@@ -54,6 +54,8 @@ SERIES = {
                      link=MOTIR_PAGE, keywords=["에틸렌", "Ethylene", "ETHYLENE"]),
     "pulp": dict(name="펄프 (SBHK)", group="petchem", unit="USD/MT", source="산업통상부 원자재가격정보",
                  link=MOTIR_PAGE, keywords=["SBHK", "활엽수", "BHKP", "펄프", "Pulp", "PULP"]),
+    "palmoil": dict(name="팜오일", group="petchem", unit="MYR/MT", source="Trading Economics (말레이시아 팜유 선물)",
+                    link="https://ko.tradingeconomics.com/commodity/palm-oil"),
 }
 # 에틸렌을 찾을 때 섞여 나오기 쉬운 다른 품목
 EXCLUDE = {"ethylene": ["폴리", "PE", "글리콜", "EG", "EDC", "Poly", "POLY"],
@@ -603,6 +605,7 @@ NAME_ALIASES = {
     "naphtha": ["naphtha", "나프타", "납사"], "ethylene": ["ethylene", "에틸렌"],
     "pulp": ["pulp", "펄프", "sbhk"], "usdkrw": ["usdkrw", "달러", "usd"], "cnykrw": ["cnykrw", "위안", "cny"],
     "jpykrw": ["jpykrw", "엔", "jpy"], "wti": ["wti"], "brent": ["brent", "브렌트"],
+    "palmoil": ["palmoil", "팜", "palm"],
 }
 
 
@@ -643,6 +646,48 @@ def merge_backfill(data: dict):
                 upsert(data["series"][k]["history"], d, v)
                 n += 1
     log(f"backfill.csv 병합: {n}개 값")
+
+
+# ---------------------------------------------------------------- Trading Economics (팜오일)
+TE_PALM_URL = os.environ.get("TE_PALM_URL", "https://ko.tradingeconomics.com/commodity/palm-oil")
+ISO_DATE = re.compile(r"(20\d{2})-(\d{1,2})-(\d{1,2})")
+
+
+def parse_te_row(html: str, slug: str = "commodity/palm-oil") -> tuple[str | None, float] | None:
+    """원자재 표에서 해당 품목 링크가 있는 행의 (날짜, 가격)"""
+    soup = BeautifulSoup(html, "html.parser")
+    for tr in soup.find_all("tr"):
+        a = tr.find("a", href=re.compile(re.escape(slug) + r"/?$"))
+        if not a:
+            continue
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all("td")]
+        price = None
+        for c in cells:
+            t = c.replace(" ", "")
+            if re.fullmatch(r"[\d,]+\.\d+|[\d,]{3,}", t):
+                price = to_float(t)
+                break
+        m = ISO_DATE.search(" ".join(cells))
+        if price:
+            return (norm_date(m.group(0)) if m else None), price
+    return None
+
+
+def update_palmoil(series: dict):
+    s = series["palmoil"]
+    r = requests.get(TE_PALM_URL, headers=UA, timeout=30)
+    r.raise_for_status()
+    r.encoding = "utf-8"
+    got = parse_te_row(r.text)
+    if not got:
+        save_debug("te_palmoil.html", r.text)
+        raise RuntimeError("Trading Economics 페이지에서 팜유 가격을 찾지 못함 (data/debug 확인)")
+    d, v = got
+    upsert(s["history"], d or now_kst().date().isoformat(), v)
+    s["status"] = "ok"
+    s["source_used"] = "Trading Economics"
+    s.pop("error", None)
+    log("palmoil", d, v)
 
 
 # ---------------------------------------------------------------- 알림
@@ -716,6 +761,7 @@ def main():
     for k in ("wti", "brent"):
         steps.append((k, lambda k=k: update_yahoo(data["series"], k)))
     steps.append(("석유화학/펄프", lambda: update_petchem(data)))
+    steps.append(("palmoil", lambda: update_palmoil(data["series"])))
 
     for label, fn in steps:
         try:
