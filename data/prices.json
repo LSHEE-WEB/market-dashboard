@@ -8098,7 +8098,11 @@
     },
     {
      "date": "2026-11-24",
-     "value": 80.77
+     "value": 82.05
+    },
+    {
+     "date": "2026-11-25",
+     "value": 80.67
     }
    ],
    "name": "WTI 원유",
@@ -8109,11 +8113,11 @@
    "status": "ok",
    "source_used": "Yahoo Finance",
    "change": {
-    "prev_date": "2026-11-23",
-    "prev": 80.17,
-    "date": "2026-11-24",
-    "value": 80.77,
-    "pct": 0.75
+    "prev_date": "2026-11-24",
+    "prev": 82.05,
+    "date": "2026-11-25",
+    "value": 80.67,
+    "pct": -1.68
    }
   },
   "brent": {
@@ -10172,7 +10176,11 @@
     },
     {
      "date": "2026-11-24",
-     "value": 87.5
+     "value": 91.4
+    },
+    {
+     "date": "2026-11-25",
+     "value": 87.46
     }
    ],
    "name": "브렌트유",
@@ -10183,11 +10191,11 @@
    "status": "ok",
    "source_used": "Yahoo Finance",
    "change": {
-    "prev_date": "2026-11-23",
-    "prev": 89.37,
-    "date": "2026-11-24",
-    "value": 87.5,
-    "pct": -2.09
+    "prev_date": "2026-11-24",
+    "prev": 91.4,
+    "date": "2026-11-25",
+    "value": 87.46,
+    "pct": -4.31
    }
   },
   "naphtha": {
@@ -12860,7 +12868,7 @@
   "brent:2026-11-09",
   "naphtha:2026-11-20"
  ],
- "updated_at": "2026-11-25T13:04:16+09:00",
+ "updated_at": "2026-11-25T14:13:55+09:00",
  "threshold": 5.0,
  "smbs_empty_dates": [
   "2024-12-25",
